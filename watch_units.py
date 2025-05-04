@@ -19,12 +19,12 @@ import threading
 URL = "https://book-ourcampus.securerc.co.uk/onlineleasing/ourcampus-amsterdam-diemen/floorplans.aspx"
 
 # Time window configurations
-HIGH_PRIORITY_MIN = 45  # seconds (45 seconds minimum)
-HIGH_PRIORITY_MAX = 75  # seconds (75 seconds maximum)
-MEDIUM_PRIORITY_MIN = 90  # seconds (1.5 minutes minimum)
-MEDIUM_PRIORITY_MAX = 150  # seconds (2.5 minutes maximum)
-NORMAL_CHECK_INTERVAL_MIN = 3  # minutes (minimum for normal priority)
-NORMAL_CHECK_INTERVAL_MAX = 8  # minutes (maximum for normal priority)
+HIGH_PRIORITY_MIN = 20  # seconds
+HIGH_PRIORITY_MAX = 40  # seconds
+MEDIUM_PRIORITY_MIN = 45  # seconds
+MEDIUM_PRIORITY_MAX = 75  # seconds
+NORMAL_CHECK_INTERVAL_MIN = 1  # minutes
+NORMAL_CHECK_INTERVAL_MAX = 4  # minutes
 
 # Define priority time windows
 HIGH_PRIORITY_WINDOWS = [
@@ -62,27 +62,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Enhanced list of user agents to rotate
+# List of user agents to rotate
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Edg/91.0.864.59',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
 ]
-
-# Optional: Proxy list (UNCOMMENT AND ADD YOUR PROXIES)
-"""
-PROXIES = [
-    # Add your proxies here in the format "http://ip:port" or "http://username:password@ip:port"
-    # "http://123.45.67.89:8080",
-]
-"""
 
 def init_database():
     """Initialize SQLite database for tracking apartment availability history."""
@@ -125,86 +112,83 @@ def init_database():
 
 def log_availability(conn, check_id, apartment_type, availability_text, button_text, available):
     """Log apartment availability to database."""
-    c = conn.cursor()
-    timestamp = datetime.now().isoformat()
-    c.execute(
-        "INSERT INTO availability_history VALUES (?, ?, ?, ?, ?, ?)",
-        (timestamp, check_id, apartment_type, availability_text, button_text, 1 if available else 0)
-    )
-    conn.commit()
+    if not conn:
+        return
+        
+    try:
+        c = conn.cursor()
+        timestamp = datetime.now().isoformat()
+        c.execute(
+            "INSERT INTO availability_history VALUES (?, ?, ?, ?, ?, ?)",
+            (timestamp, check_id, apartment_type, availability_text, button_text, 1 if available else 0)
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error logging availability: {e}")
 
 def log_notification(conn, message, sent_successfully):
     """Log notification to database."""
-    c = conn.cursor()
-    timestamp = datetime.now().isoformat()
-    c.execute(
-        "INSERT INTO notifications VALUES (?, ?, ?)",
-        (timestamp, message, 1 if sent_successfully else 0)
-    )
-    conn.commit()
+    if not conn:
+        return
+        
+    try:
+        c = conn.cursor()
+        timestamp = datetime.now().isoformat()
+        c.execute(
+            "INSERT INTO notifications VALUES (?, ?, ?)",
+            (timestamp, message, 1 if sent_successfully else 0)
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error logging notification: {e}")
 
 def update_stats(conn, found_availability=False, error=False):
     """Update daily statistics."""
-    c = conn.cursor()
-    today = datetime.now().strftime('%Y-%m-%d')
-    
-    # Check if we have a record for today
-    c.execute("SELECT * FROM stats WHERE date = ?", (today,))
-    record = c.fetchone()
-    
-    if record:
-        # Update existing record
-        c.execute(
-            "UPDATE stats SET num_checks = num_checks + 1, num_availability_found = num_availability_found + ?, errors = errors + ? WHERE date = ?",
-            (1 if found_availability else 0, 1 if error else 0, today)
-        )
-    else:
-        # Create new record
-        c.execute(
-            "INSERT INTO stats VALUES (?, ?, ?, ?)",
-            (today, 1, 1 if found_availability else 0, 1 if error else 0)
-        )
-    
-    conn.commit()
+    if not conn:
+        return
+        
+    try:
+        c = conn.cursor()
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        # Check if we have a record for today
+        c.execute("SELECT * FROM stats WHERE date = ?", (today,))
+        record = c.fetchone()
+        
+        if record:
+            # Update existing record
+            c.execute(
+                "UPDATE stats SET num_checks = num_checks + 1, num_availability_found = num_availability_found + ?, errors = errors + ? WHERE date = ?",
+                (1 if found_availability else 0, 1 if error else 0, today)
+            )
+        else:
+            # Create new record
+            c.execute(
+                "INSERT INTO stats VALUES (?, ?, ?, ?)",
+                (today, 1, 1 if found_availability else 0, 1 if error else 0)
+            )
+        
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error updating stats: {e}")
 
 def setup_driver():
-    """Set up and return a Chrome WebDriver instance with enhanced anti-detection measures."""
+    """Lightweight browser setup for faster loading."""
     chrome_options = Options()
-    chrome_options.add_argument("--headless")  # Run in headless mode (no browser UI)
+    chrome_options.add_argument("--headless")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--window-size=1366,768")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--no-sandbox")
     
-    # Randomize user agent to avoid detection
+    # Disable images, CSS, and other resources to speed up loading
+    chrome_options.add_argument("--disable-images")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--blink-settings=imagesEnabled=false")
+    
+    # Only keep essential options, remove complex anti-detection
     user_agent = random.choice(USER_AGENTS)
     chrome_options.add_argument(f"--user-agent={user_agent}")
-    
-    # Additional settings to make the browser look more like a regular user
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option("useAutomationExtension", False)
-    
-    # Add random viewport size (common desktop resolutions)
-    viewports = [
-        "1920,1080", "1366,768", "1536,864", "1440,900", 
-        "1280,720", "1600,900", "1280,800", "1280,1024"
-    ]
-    chrome_options.add_argument(f"--window-size={random.choice(viewports)}")
-    
-    # Optional: Add proxy if available (UNCOMMENT IF USING PROXIES)
-    """
-    if 'PROXIES' in globals() and PROXIES:
-        proxy = random.choice(PROXIES)
-        chrome_options.add_argument(f'--proxy-server={proxy}')
-        logger.info(f"Using proxy: {proxy}")
-    """
-    
-    # Set timezone to match common European settings
-    chrome_options.add_argument("--timezone=Europe/Amsterdam")
-    
-    # Add language settings common for the target site
-    chrome_options.add_argument("--lang=en-GB,en-US;q=0.9,en;q=0.8,nl;q=0.7")
     
     try:
         # Try to use webdriver manager to automatically download the driver
@@ -212,109 +196,64 @@ def setup_driver():
         driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
     except Exception as e:
         logger.warning(f"Failed to use webdriver_manager: {e}. Falling back to local chromedriver.")
-        # Fallback to local chromedriver if webdriver_manager is not available
-        driver = webdriver.Chrome(options=chrome_options)
-    
-    # Additional settings to avoid detection
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    
-    # Add additional navigator properties to appear more like a real browser
-    driver.execute_script("""
-    if (navigator.plugins) {
-        Object.defineProperty(navigator, 'plugins', {
-            get: function() { return [1, 2, 3, 4, 5]; }
-        });
-    }
-    
-    if (navigator.languages) {
-        Object.defineProperty(navigator, 'languages', {
-            get: function() { return ['en-GB', 'en', 'nl']; }
-        });
-    }
-    """)
-    
-    # Set cookies to appear like a returning visitor
-    driver.get(URL)  # Need to navigate to the domain before setting cookies
-    
-    # Add some common cookies
-    cookie_names = ["_ga", "_gid", "visitor_id", "session_id"]
-    for name in cookie_names:
-        value = ''.join(random.choices('0123456789abcdef', k=16))
-        
-        # Random expiration between 1 day and 1 year from now
-        expiry = datetime.now() + timedelta(days=random.randint(1, 365))
-        expiry_seconds = int(expiry.timestamp())
-        
-        cookie = {
-            'name': name,
-            'value': value,
-            'domain': '.securerc.co.uk',  # Domain should match the site
-            'path': '/',
-            'expiry': expiry_seconds,
-            'secure': True
-        }
-        
+        # Fallback to local chromedriver
         try:
-            driver.add_cookie(cookie)
+            driver = webdriver.Chrome(options=chrome_options)
         except Exception as e:
-            # Just log and continue if adding a cookie fails
-            logger.debug(f"Failed to add cookie {name}: {e}")
+            logger.error(f"Error creating Chrome driver: {e}")
+            try:
+                driver = webdriver.Chrome(service=Service("./chromedriver"), options=chrome_options)
+            except Exception as e:
+                logger.error(f"Final attempt to create driver failed: {e}")
+                raise
+    
+    # Set page load timeout to prevent hanging
+    driver.set_page_load_timeout(30)
     
     return driver
 
-def wait_for_element(driver, by, selector, timeout=30, poll_frequency=0.5):
-    """Wait for an element to be present with better error handling."""
+def wait_for_element(driver, by, selector, timeout=15, poll_frequency=0.3):
+    """Faster wait with lower timeout."""
     try:
         return WebDriverWait(driver, timeout, poll_frequency).until(
             EC.presence_of_element_located((by, selector))
         )
-    except TimeoutException:
+    except Exception as e:
         logger.error(f"Element not found: {selector}")
         return None
-    except Exception as e:
-        logger.error(f"Error waiting for element {selector}: {e}")
-        return None
 
-def safely_click(driver, element, retries=3):
-    """Attempt to safely click an element with retries for common issues."""
+def safely_click(driver, element, retries=2):
+    """Attempt to safely click an element with fewer retries for speed."""
     for attempt in range(retries):
         try:
-            # First try to scroll the element into view
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
-            time.sleep(0.5)  # Give the page time to settle after scrolling
-            
-            # Try to click it normally first
+            # Click directly without scrolling first to save time
             element.click()
             return True
         except StaleElementReferenceException:
             if attempt < retries - 1:
-                logger.debug(f"StaleElementReference, retrying click... (attempt {attempt+1})")
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
             else:
-                logger.error("Element became stale, max retries exceeded")
                 return False
         except Exception as e:
             # If normal click fails, try JavaScript click
             try:
                 driver.execute_script("arguments[0].click();", element)
                 return True
-            except Exception as js_error:
+            except Exception:
                 if attempt < retries - 1:
-                    logger.debug(f"Click failed, retrying... (attempt {attempt+1}): {e}")
-                    time.sleep(1)
+                    time.sleep(0.5)
                     continue
                 else:
-                    logger.error(f"Failed to click element after {retries} attempts: {js_error}")
                     return False
     return False
 
 def add_random_delay():
-    """Add a slightly randomized delay to appear more human-like."""
-    base_delay = random.uniform(1, 3)
-    # Occasionally add a longer delay
-    if random.random() < 0.2:  # 20% chance
-        base_delay += random.uniform(1, 3)
+    """Shorter random delay for faster checks."""
+    base_delay = random.uniform(0.3, 1.0)
+    # Only occasionally add longer delay (10% chance)
+    if random.random() < 0.1:
+        base_delay += random.uniform(0.5, 1.5)
     time.sleep(base_delay)
 
 def get_check_interval():
@@ -359,7 +298,7 @@ def get_check_interval():
     return interval
 
 def check_availability(driver, db_conn):
-    """Check for apartment availability on the website with improved error handling and data storage."""
+    """Check for apartment availability on the website with improved speed."""
     global last_check_time
     
     logger.info("Checking for apartment availability...")
@@ -367,37 +306,23 @@ def check_availability(driver, db_conn):
     check_id = datetime.now().strftime('%Y%m%d%H%M%S')  # Unique ID for this check
     
     try:
+        # Load the page directly
         driver.get(URL)
-        add_random_delay()
         
-        # Wait for the main container to load
-        container = wait_for_element(driver, By.ID, "floorPlanDataContainer", timeout=45)
+        # Wait for the main container to load with shorter timeout
+        container = wait_for_element(driver, By.ID, "floorPlanDataContainer", timeout=20)
         if not container:
             logger.error("Main container not found - page may have changed structure")
             update_stats(db_conn, error=True)
             return []
         
-        # Make some random mouse movements to appear more human-like
-        driver.execute_script("""
-            var event = new MouseEvent('mousemove', {
-                'view': window,
-                'bubbles': true,
-                'cancelable': true,
-                'clientX': Math.floor(Math.random() * window.innerWidth),
-                'clientY': Math.floor(Math.random() * window.innerHeight)
-            });
-            document.dispatchEvent(event);
-        """)
-        
         apartments_available = []
         
-        # Try multiple selector approaches to find the floor plan tabs
-        # This makes the script more resilient to website changes
+        # Try multiple selectors in order of specificity
         tab_selector_options = [
             {"by": By.CSS_SELECTOR, "selector": "a[href='#FP_Detail_1100004']"},
             {"by": By.XPATH, "selector": "//a[contains(@href, '#FP_Detail_1100004')]"},
-            {"by": By.XPATH, "selector": "//li[contains(@class, 'FPTabLi')]/a[1]"},
-            {"by": By.XPATH, "selector": "//ul[@id='floorplansLink']/li/a[1]"}
+            {"by": By.XPATH, "selector": "//li[contains(@class, 'FPTabLi')]/a[1]"}
         ]
         
         # Check the first apartment type (1 Person)
@@ -408,142 +333,126 @@ def check_availability(driver, db_conn):
                 try:
                     one_person_tab = driver.find_element(selector_option["by"], selector_option["selector"])
                     if one_person_tab:
-                        logger.debug(f"Found 1-person tab using selector: {selector_option['selector']}")
                         break
                 except NoSuchElementException:
                     continue
             
             if not one_person_tab:
-                raise Exception("Could not find 1-person apartment tab using any selector")
+                raise Exception("Could not find 1-person apartment tab")
             
             # Click the tab to show the apartment details
             safely_click(driver, one_person_tab)
-            add_random_delay()
+            time.sleep(0.5)  # Short fixed delay
             
-            # Try multiple approaches to get availability and button text
+            # Try to get availability text and button text with faster direct selectors
             try:
-                # First attempt with specific selectors
                 availability_text = driver.find_element(By.XPATH, "//div[@id='FP_Detail_1100004']//div[@class='availability-count']").text.strip()
             except Exception:
-                try:
-                    # Try a more general approach
-                    availability_elements = driver.find_elements(By.CLASS_NAME, "availability-count")
-                    availability_text = availability_elements[0].text.strip() if availability_elements else "Unknown"
-                except Exception as e:
-                    logger.warning(f"Could not get availability text using any method: {e}")
-                    availability_text = "Unknown"
+                availability_text = "Unknown"
             
             try:
-                # First attempt with specific selectors
                 button_text = driver.find_element(By.XPATH, "//div[@id='FP_Detail_1100004']//button[contains(@class, 'btn')]").text.strip()
             except Exception:
-                try:
-                    # Try a more general approach
-                    button_elements = driver.find_elements(By.XPATH, "//button[contains(@class, 'btn')]")
-                    button_text = button_elements[0].text.strip() if button_elements else "Unknown"
-                except Exception as e:
-                    logger.warning(f"Could not get button text using any method: {e}")
-                    button_text = "Unknown"
+                button_text = "Unknown"
             
-            logger.info(f"1 Person Apartment - Availability text: '{availability_text}', Button text: '{button_text}'")
+            logger.info(f"1 Person Apartment - Button text: '{button_text}'")
             
-            # Log this information regardless of availability
-            log_availability(db_conn, check_id, "1 Person Apartment", availability_text, button_text, 
-                           button_text != "CONTACT US" and button_text != "Contact Us")
+            # Log to database in separate thread to avoid slowing down the main flow
+            threading.Thread(
+                target=log_availability,
+                args=(db_conn, check_id, "1 Person Apartment", availability_text, button_text, 
+                    button_text != "CONTACT US" and button_text != "Contact Us")
+            ).start()
             
             # Consider apartment available if button text is NOT "CONTACT US"
             if button_text and button_text != "CONTACT US" and button_text != "Contact Us":
                 apartments_available.append(f"1 Person Apartment - Button says: {button_text}")
         except Exception as e:
             logger.error(f"Error checking 1-person apartment: {e}")
-            log_availability(db_conn, check_id, "1 Person Apartment", "Error", "Error", False)
+            threading.Thread(
+                target=log_availability,
+                args=(db_conn, check_id, "1 Person Apartment", "Error", "Error", False)
+            ).start()
         
-        # Similar logic for 2-person apartment with enhanced error handling
+        # Reset selectors for the second apartment type
+        tab_selector_options = [
+            {"by": By.CSS_SELECTOR, "selector": "a[href='#FP_Detail_1100005']"},
+            {"by": By.XPATH, "selector": "//a[contains(@href, '#FP_Detail_1100005')]"},
+            {"by": By.XPATH, "selector": "//li[contains(@class, 'FPTabLi')]/a[2]"}
+        ]
+        
+        # Check the second apartment type (2 Person)
         try:
-            # Reset selectors for the second apartment type
-            tab_selector_options = [
-                {"by": By.CSS_SELECTOR, "selector": "a[href='#FP_Detail_1100005']"},
-                {"by": By.XPATH, "selector": "//a[contains(@href, '#FP_Detail_1100005')]"},
-                {"by": By.XPATH, "selector": "//li[contains(@class, 'FPTabLi')]/a[2]"},
-                {"by": By.XPATH, "selector": "//ul[@id='floorplansLink']/li/a[2]"}
-            ]
-            
             # Try different selectors until one works
             two_person_tab = None
             for selector_option in tab_selector_options:
                 try:
                     two_person_tab = driver.find_element(selector_option["by"], selector_option["selector"])
                     if two_person_tab:
-                        logger.debug(f"Found 2-person tab using selector: {selector_option['selector']}")
                         break
                 except NoSuchElementException:
                     continue
             
             if not two_person_tab:
-                raise Exception("Could not find 2-person apartment tab using any selector")
+                raise Exception("Could not find 2-person apartment tab")
             
             # Click the tab to show the apartment details
             safely_click(driver, two_person_tab)
-            add_random_delay()
+            time.sleep(0.5)  # Short fixed delay
             
-            # Try multiple approaches to get availability and button text
+            # Try to get availability text and button text with faster direct selectors
             try:
-                # First attempt with specific selectors
                 availability_text = driver.find_element(By.XPATH, "//div[@id='FP_Detail_1100005']//div[@class='availability-count']").text.strip()
             except Exception:
-                try:
-                    # Try a more general approach
-                    availability_elements = driver.find_elements(By.CLASS_NAME, "availability-count")
-                    availability_text = availability_elements[1].text.strip() if len(availability_elements) > 1 else "Unknown"
-                except Exception as e:
-                    logger.warning(f"Could not get availability text using any method: {e}")
-                    availability_text = "Unknown"
+                availability_text = "Unknown"
             
             try:
-                # First attempt with specific selectors
                 button_text = driver.find_element(By.XPATH, "//div[@id='FP_Detail_1100005']//button[contains(@class, 'btn')]").text.strip()
             except Exception:
-                try:
-                    # Try a more general approach
-                    button_elements = driver.find_elements(By.XPATH, "//button[contains(@class, 'btn')]")
-                    button_text = button_elements[1].text.strip() if len(button_elements) > 1 else "Unknown"
-                except Exception as e:
-                    logger.warning(f"Could not get button text using any method: {e}")
-                    button_text = "Unknown"
-                    
-            logger.info(f"2 Person Apartment - Availability text: '{availability_text}', Button text: '{button_text}'")
+                button_text = "Unknown"
             
-            # Log this information regardless of availability
-            log_availability(db_conn, check_id, "2 Person Apartment", availability_text, button_text, 
-                           button_text != "CONTACT US" and button_text != "Contact Us")
+            logger.info(f"2 Person Apartment - Button text: '{button_text}'")
+            
+            # Log to database in separate thread to avoid slowing down the main flow
+            threading.Thread(
+                target=log_availability,
+                args=(db_conn, check_id, "2 Person Apartment", availability_text, button_text, 
+                    button_text != "CONTACT US" and button_text != "Contact Us")
+            ).start()
             
             # Consider apartment available if button text is NOT "CONTACT US"
             if button_text and button_text != "CONTACT US" and button_text != "Contact Us":
                 apartments_available.append(f"2 Person Apartment - Button says: {button_text}")
         except Exception as e:
             logger.error(f"Error checking 2-person apartment: {e}")
-            log_availability(db_conn, check_id, "2 Person Apartment", "Error", "Error", False)
+            threading.Thread(
+                target=log_availability,
+                args=(db_conn, check_id, "2 Person Apartment", "Error", "Error", False)
+            ).start()
         
-        # Update stats
-        update_stats(db_conn, found_availability=bool(apartments_available))
+        # Update stats in a thread to avoid slowing down main execution
+        threading.Thread(
+            target=update_stats,
+            args=(db_conn, bool(apartments_available), False)
+        ).start()
         
         return apartments_available
         
     except TimeoutException:
         logger.error("Timeout waiting for page to load")
-        update_stats(db_conn, error=True)
+        threading.Thread(target=update_stats, args=(db_conn, False, True)).start()
         return []
     except WebDriverException as e:
         logger.error(f"WebDriver error: {e}")
-        update_stats(db_conn, error=True)
+        threading.Thread(target=update_stats, args=(db_conn, False, True)).start()
         return []
     except Exception as e:
         logger.error(f"Unexpected error during availability check: {e}")
-        update_stats(db_conn, error=True)
+        threading.Thread(target=update_stats, args=(db_conn, False, True)).start()
         return []
 
 def send_telegram_notification(message, db_conn=None):
-    """Send a notification message via Telegram with enhanced error handling."""
+    """Use a direct, simple HTTP request with minimal overhead."""
     telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -551,60 +460,50 @@ def send_telegram_notification(message, db_conn=None):
         "parse_mode": "HTML"
     }
     
-    # Maximum retries for sending notification
-    max_retries = 3
-    success = False
-    
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(telegram_api_url, data=payload, timeout=10)
-            if response.status_code == 200:
-                logger.info("Telegram notification sent successfully!")
-                success = True
-                break
-            else:
-                logger.error(f"Failed to send Telegram notification. Status code: {response.status_code}, Response: {response.text}")
-                if attempt < max_retries - 1:
-                    logger.info(f"Retrying in 5 seconds... (attempt {attempt+1}/{max_retries})")
-                    time.sleep(5)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error sending Telegram notification: {e}")
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in 5 seconds... (attempt {attempt+1}/{max_retries})")
-                time.sleep(5)
-        except Exception as e:
-            logger.error(f"Unexpected error sending Telegram notification: {e}")
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in 5 seconds... (attempt {attempt+1}/{max_retries})")
-                time.sleep(5)
-    
-    # Log notification to database if provided
-    if db_conn:
-        log_notification(db_conn, message, success)
-    
-    return success
+    try:
+        # Faster request with shorter timeout
+        response = requests.post(telegram_api_url, data=payload, timeout=5)
+        success = response.status_code == 200
+        
+        # Log to database outside of critical path
+        if db_conn:
+            threading.Thread(target=log_notification, 
+                           args=(db_conn, message, success)).start()
+        
+        return success
+    except Exception as e:
+        logger.error(f"Error sending notification: {e}")
+        if db_conn:
+            threading.Thread(target=log_notification, 
+                           args=(db_conn, message, False)).start()
+        return False
 
-def test_telegram(db_conn=None):
-    """Test the Telegram notification system."""
-    logger.info("Testing Telegram notification...")
-    test_message = "🏠 OurCampus Monitor: This is a test message. The script is running correctly!"
-    success = send_telegram_notification(test_message, db_conn)
-    if success:
-        logger.info("Telegram test successful!")
-    else:
-        logger.error("Telegram test failed!")
-    return success
+def send_startup_notification(db_conn=None):
+    """Send a startup notification to confirm Telegram is working."""
+    startup_message = f"🏠 <b>OurCampus Monitor Started</b> 🏠\n\n" + \
+                      f"Monitoring started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n" + \
+                      f"Priority-based checking:\n" + \
+                      f"• High Priority: {HIGH_PRIORITY_MIN}-{HIGH_PRIORITY_MAX} seconds (Wednesdays 12:00-15:30)\n" + \
+                      f"• Medium Priority: {MEDIUM_PRIORITY_MIN}-{MEDIUM_PRIORITY_MAX} seconds (Weekday afternoons)\n" + \
+                      f"• Normal Priority: {NORMAL_CHECK_INTERVAL_MIN}-{NORMAL_CHECK_INTERVAL_MAX} minutes (All other times)\n\n" + \
+                      f"Available commands:\n" + \
+                      f"• /last - Show last check time\n" + \
+                      f"• /status - Show full status\n" + \
+                      f"• /stats - Show statistics\n" + \
+                      f"• /help - Show commands"
+    
+    return send_telegram_notification(startup_message, db_conn)
 
 def process_telegram_commands(db_conn=None):
-    """Process incoming Telegram commands with improved error handling."""
+    """Process incoming Telegram commands with minimal overhead."""
     global last_command_update_id
     
     try:
-        # Get updates from Telegram
+        # Get updates from Telegram with short timeout
         response = requests.get(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
             params={"offset": last_command_update_id + 1, "timeout": 1},
-            timeout=10
+            timeout=3
         )
         
         if response.status_code == 200:
@@ -664,19 +563,19 @@ def handle_last_command(chat_id, db_conn=None):
             try:
                 c = db_conn.cursor()
                 c.execute("""
-                    SELECT apartment_type, availability_text, button_text, available 
+                    SELECT apartment_type, button_text, available 
                     FROM availability_history 
                     ORDER BY timestamp DESC 
-                    LIMIT 4
+                    LIMIT 2
                 """)
                 results = c.fetchall()
                 
                 if results:
-                    message += "\n\n<b>Latest availability info:</b>\n"
+                    message += "\n\n<b>Latest apartment status:</b>\n"
                     for result in results:
-                        apt_type, avail_text, btn_text, is_available = result
+                        apt_type, btn_text, is_available = result
                         status = "✅ AVAILABLE" if is_available else "❌ Not available"
-                        message += f"• {apt_type}: {status} ({btn_text})\n"
+                        message += f"• {apt_type}: {status}\n"
             except Exception as e:
                 logger.error(f"Error getting last availability from database: {e}")
     else:
@@ -696,14 +595,14 @@ def handle_status_command(chat_id, db_conn=None):
     
     message = f"🏠 <b>OurCampus Monitor Status</b>\n\n"
     message += f"• Script is running: ✅\n"
-    message += f"• Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    message += f"• Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
     message += f"• Uptime: {uptime_str}\n"
     
     if last_check_time:
         time_ago = datetime.now() - last_check_time
         minutes_ago = time_ago.total_seconds() // 60
-        message += f"• Last check: {last_check_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        message += f"• Time since last check: {int(minutes_ago)} minutes\n"
+        message += f"• Last check: {last_check_time.strftime('%H:%M:%S')}\n"
+        message += f"• Time since: {int(minutes_ago)} minutes\n"
     else:
         message += f"• Last check: None yet\n"
     
@@ -714,7 +613,7 @@ def handle_status_command(chat_id, db_conn=None):
             time_until = next_check_time - datetime.now()
             seconds_until = time_until.total_seconds()
             message += f"• Next check: {next_check_time.strftime('%H:%M:%S')}\n"
-            message += f"• Time until next check: {int(seconds_until)} seconds\n"
+            message += f"• Time until next: {int(seconds_until)} seconds\n"
     
     # Get current priority window
     now = datetime.now()
@@ -746,47 +645,16 @@ def handle_status_command(chat_id, db_conn=None):
                 break
     
     if in_high_priority:
-        message += f"• Current priority: 🔥 HIGH (checking every {HIGH_PRIORITY_MIN/60}-{HIGH_PRIORITY_MAX/60} minutes)\n"
+        message += f"• Priority: 🔥 HIGH ({HIGH_PRIORITY_MIN}-{HIGH_PRIORITY_MAX}s)\n"
     elif in_medium_priority:
-        message += f"• Current priority: ⚡ MEDIUM (checking every {MEDIUM_PRIORITY_MIN/60}-{MEDIUM_PRIORITY_MAX/60} minutes)\n"
+        message += f"• Priority: ⚡ MEDIUM ({MEDIUM_PRIORITY_MIN}-{MEDIUM_PRIORITY_MAX}s)\n"
     else:
-        message += f"• Current priority: 🕙 NORMAL (checking every {NORMAL_CHECK_INTERVAL_MIN}-{NORMAL_CHECK_INTERVAL_MAX} minutes)\n"
-    
-    # Add database stats if available
-    if db_conn:
-        try:
-            c = db_conn.cursor()
-            
-            # Total checks today
-            today = datetime.now().strftime('%Y-%m-%d')
-            c.execute("SELECT num_checks, num_availability_found, errors FROM stats WHERE date = ?", (today,))
-            today_stats = c.fetchone()
-            
-            if today_stats:
-                checks, found, errors = today_stats
-                message += f"\n<b>Today's Stats:</b>\n"
-                message += f"• Checks performed: {checks}\n"
-                message += f"• Availabilities found: {found}\n"
-                message += f"• Errors encountered: {errors}\n"
-            
-            # All-time stats
-            c.execute("SELECT COUNT(*) FROM availability_history")
-            all_checks = c.fetchone()[0]
-            
-            c.execute("SELECT COUNT(*) FROM availability_history WHERE available = 1")
-            all_available = c.fetchone()[0]
-            
-            message += f"\n<b>All-time Stats:</b>\n"
-            message += f"• Total checks: {all_checks}\n"
-            message += f"• Total availabilities: {all_available}\n"
-            
-        except Exception as e:
-            logger.error(f"Error getting stats from database: {e}")
+        message += f"• Priority: 🕙 NORMAL ({NORMAL_CHECK_INTERVAL_MIN}-{NORMAL_CHECK_INTERVAL_MAX}m)\n"
     
     send_telegram_notification(message, db_conn)
 
 def handle_stats_command(chat_id, db_conn=None):
-    """Handle the /stats command: Show detailed statistics."""
+    """Handle the /stats command: Show simplified statistics."""
     if not db_conn:
         message = "⚠️ Database not available for statistics."
         send_telegram_notification(message)
@@ -795,49 +663,31 @@ def handle_stats_command(chat_id, db_conn=None):
     try:
         c = db_conn.cursor()
         
-        # Get total statistics
+        # Get total checks
         c.execute("SELECT COUNT(*) FROM availability_history")
         total_checks = c.fetchone()[0]
         
+        # Get total availabilities
         c.execute("SELECT COUNT(*) FROM availability_history WHERE available = 1")
         total_availabilities = c.fetchone()[0]
         
-        c.execute("SELECT COUNT(DISTINCT date) FROM stats")
-        days_running = c.fetchone()[0]
+        # Create the message
+        message = f"📊 <b>Statistics</b>\n\n"
+        message += f"• Total checks: {total_checks}\n"
+        message += f"• Total availabilities: {total_availabilities}\n"
         
-        # Get last 5 days of stats
+        # Get availability by apartment type (simplified)
         c.execute("""
-            SELECT date, num_checks, num_availability_found, errors
-            FROM stats
-            ORDER BY date DESC
-            LIMIT 5
-        """)
-        daily_stats = c.fetchall()
-        
-        # Get availability by apartment type
-        c.execute("""
-            SELECT apartment_type, COUNT(*) as total_checks, SUM(available) as times_available
+            SELECT apartment_type, SUM(available) as times_available
             FROM availability_history
             GROUP BY apartment_type
         """)
         apartment_stats = c.fetchall()
         
-        # Create the message
-        message = f"📊 <b>OurCampus Monitor Statistics</b>\n\n"
-        message += f"<b>Overview:</b>\n"
-        message += f"• Days monitored: {days_running}\n"
-        message += f"• Total checks: {total_checks}\n"
-        message += f"• Total availabilities found: {total_availabilities}\n"
-        message += f"• Availability rate: {round(total_availabilities/total_checks*100, 2)}%\n\n"
-        
-        message += f"<b>By Apartment Type:</b>\n"
-        for apt_type, checks, available in apartment_stats:
-            rate = round(available/checks*100, 2) if checks > 0 else 0
-            message += f"• {apt_type}: {available}/{checks} ({rate}%)\n"
-        
-        message += f"\n<b>Last 5 Days:</b>\n"
-        for date, checks, found, errors in daily_stats:
-            message += f"• {date}: {checks} checks, {found} available, {errors} errors\n"
+        if apartment_stats:
+            message += f"\n<b>By Apartment Type:</b>\n"
+            for apt_type, available in apartment_stats:
+                message += f"• {apt_type}: {available} times available\n"
         
         send_telegram_notification(message, db_conn)
     except Exception as e:
@@ -847,30 +697,27 @@ def handle_stats_command(chat_id, db_conn=None):
 
 def handle_help_command(chat_id, db_conn=None):
     """Handle the /help command: Show available commands."""
-    message = f"🏠 <b>OurCampus Monitor Help</b>\n\n"
-    message += f"Available commands:\n"
-    message += f"• /last - Show last check time and latest availability\n"
-    message += f"• /status - Show full status of the monitor\n"
-    message += f"• /stats - Show detailed statistics\n"
-    message += f"• /restart - Prompt for restart (if script is set up with restart capability)\n"
-    message += f"• /help - Show this help message"
+    message = f"🏠 <b>Available Commands</b>\n\n"
+    message += f"• /last - Last check time\n"
+    message += f"• /status - Monitor status\n"
+    message += f"• /stats - Show statistics\n"
+    message += f"• /restart - Restart info\n"
+    message += f"• /help - This help message"
     
     send_telegram_notification(message, db_conn)
 
 def handle_restart_command(chat_id, db_conn=None):
     """Handle the /restart command: Suggest manual restart procedures."""
     message = f"⚠️ <b>Restart Request</b>\n\n"
-    message += f"The script doesn't have auto-restart capability.\n\n"
-    message += f"To restart the script manually:\n"
-    message += f"1. Connect to your server\n"
-    message += f"2. Stop the current process\n"
-    message += f"3. Run 'python3 apartment_monitor.py'\n\n"
-    message += f"You can also set up a systemd service or cron job to automatically restart the script if it crashes."
+    message += f"To restart manually:\n"
+    message += f"1. Connect to server\n"
+    message += f"2. Stop current process\n"
+    message += f"3. Run 'python3 apartment_monitor.py'"
     
     send_telegram_notification(message, db_conn)
 
-def main(test_mode=False):
-    """Main function to monitor apartment availability with improved database support."""
+def main():
+    """Main function to monitor apartment availability with improved speed."""
     global start_time, next_check_time
     
     start_time = datetime.now()  # Track when the script started
@@ -884,29 +731,8 @@ def main(test_mode=False):
         logger.error(f"Error initializing database: {e}")
         db_conn = None
     
-    # Test Telegram notification first
-    if not test_telegram(db_conn):
-        logger.error("Failed to send test notification. Exiting.")
-        return
-    
-    # Send startup notification with timestamp
-    startup_message = f"🏠 <b>OurCampus Monitor Started</b> 🏠\n\n" + \
-                     f"Monitoring started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n" + \
-                     f"Priority-based checking:\n" + \
-                     f"• High Priority: {HIGH_PRIORITY_MIN/60}-{HIGH_PRIORITY_MAX/60} minutes (Wednesdays 12:00-15:30)\n" + \
-                     f"• Medium Priority: {MEDIUM_PRIORITY_MIN/60}-{MEDIUM_PRIORITY_MAX/60} minutes (Weekday afternoons)\n" + \
-                     f"• Normal Priority: {NORMAL_CHECK_INTERVAL_MIN}-{NORMAL_CHECK_INTERVAL_MAX} minutes (All other times)\n\n" + \
-                     f"I'll notify you as soon as apartments become available!\n\n" + \
-                     f"Available commands:\n" + \
-                     f"• /last - Show last check time\n" + \
-                     f"• /status - Show full status\n" + \
-                     f"• /stats - Show detailed statistics\n" + \
-                     f"• /help - Show available commands"
-    
-    send_telegram_notification(startup_message, db_conn)
-    
-    if test_mode:
-        logger.info("Running in TEST MODE - will check once and exit")
+    # Send startup notification
+    send_startup_notification(db_conn)
     
     driver = None
     
@@ -947,11 +773,6 @@ def main(test_mode=False):
                         send_telegram_notification(message, db_conn)
                         last_notified = set()
                 
-                # Exit after one check if in test mode
-                if test_mode:
-                    logger.info("Test completed. Exiting.")
-                    break
-                
                 # Check for Telegram commands every 10 seconds
                 current_time = time.time()
                 if current_time - command_check_time > 10:
@@ -960,46 +781,44 @@ def main(test_mode=False):
                 
                 # Determine the next check interval based on current time
                 check_interval = get_check_interval()
-                next_check_time = datetime.now()
-                next_check_time = next_check_time.replace(microsecond=0)  # Remove microseconds for cleaner display
-                next_timestamp = next_check_time.timestamp() + check_interval
-                next_check_time = datetime.fromtimestamp(next_timestamp)
+                next_check_time = datetime.now().replace(microsecond=0)
+                next_check_time = datetime.fromtimestamp(next_check_time.timestamp() + check_interval)
                 
                 logger.info(f"Next check at {next_check_time.strftime('%H:%M:%S')}")
                 
                 # Sleep in shorter intervals while checking for commands
                 remaining_sleep = check_interval
                 while remaining_sleep > 0:
-                    sleep_interval = min(10, remaining_sleep)  # Sleep for 10 seconds at a time to check for commands
+                    sleep_interval = min(5, remaining_sleep)  # Sleep for 5 seconds at a time (faster command response)
                     time.sleep(sleep_interval)
                     remaining_sleep -= sleep_interval
                     
-                    # Check for commands during long sleep periods
+                    # Check for commands during sleep periods
                     process_telegram_commands(db_conn)
                 
                 # Increment browser restart counter
                 browser_restart_counter += 1
                 
-                # Restart the browser periodically to avoid memory issues
-                if browser_restart_counter >= 10:  # Restart every 10 checks
-                    logger.info("Scheduled browser restart to avoid detection/memory issues")
+                # Restart the browser every 15 checks to avoid memory issues
+                if browser_restart_counter >= 15:
+                    logger.info("Scheduled browser restart")
                     browser_restart_counter = 0
                     driver.quit()
                     driver = setup_driver()
                 
             except Exception as e:
                 logger.error(f"Error during check: {e}")
-                time.sleep(60)  # Wait a minute before trying again after an error
+                time.sleep(30)  # Wait 30 seconds before trying again after an error
                 
                 # Restart the browser after errors
                 try:
                     if driver:
                         driver.quit()
                     driver = setup_driver()
-                    browser_restart_counter = 0  # Reset counter after restart
+                    browser_restart_counter = 0
                 except Exception as browser_error:
                     logger.error(f"Error restarting browser: {browser_error}")
-                    time.sleep(60)
+                    time.sleep(30)
                 
     finally:
         if driver:
@@ -1011,5 +830,5 @@ def main(test_mode=False):
         logger.info("OurCampus monitor stopped")
 
 if __name__ == "__main__":
-    # Run in continuous mode (set to True for test mode)
-    main(test_mode=False)
+    # Run the monitor
+    main()
