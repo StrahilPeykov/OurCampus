@@ -4,6 +4,8 @@ import requests
 import json
 import os
 import sqlite3
+import psutil
+import argparse
 from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -14,17 +16,25 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException, StaleElementReferenceException, NoSuchElementException
 import logging
 import threading
+from pathlib import Path
+
+# Try to import dotenv (but don't fail if it's not installed)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("dotenv not installed. Environment variables must be set manually.")
 
 # Configuration
 URL = "https://book-ourcampus.securerc.co.uk/onlineleasing/ourcampus-amsterdam-diemen/floorplans.aspx"
 
-# Time window configurations
-HIGH_PRIORITY_MIN = 20  # seconds
-HIGH_PRIORITY_MAX = 40  # seconds
-MEDIUM_PRIORITY_MIN = 45  # seconds
-MEDIUM_PRIORITY_MAX = 75  # seconds
-NORMAL_CHECK_INTERVAL_MIN = 1  # minutes
-NORMAL_CHECK_INTERVAL_MAX = 4  # minutes
+# Time window configurations with sensible defaults (can be overridden via .env)
+HIGH_PRIORITY_MIN = int(os.getenv("HIGH_PRIORITY_MIN", 20))  # seconds
+HIGH_PRIORITY_MAX = int(os.getenv("HIGH_PRIORITY_MAX", 40))  # seconds
+MEDIUM_PRIORITY_MIN = int(os.getenv("MEDIUM_PRIORITY_MIN", 45))  # seconds
+MEDIUM_PRIORITY_MAX = int(os.getenv("MEDIUM_PRIORITY_MAX", 75))  # seconds
+NORMAL_CHECK_INTERVAL_MIN = int(os.getenv("NORMAL_CHECK_INTERVAL_MIN", 1))  # minutes
+NORMAL_CHECK_INTERVAL_MAX = int(os.getenv("NORMAL_CHECK_INTERVAL_MAX", 4))  # minutes
 
 # Define priority time windows
 HIGH_PRIORITY_WINDOWS = [
@@ -39,17 +49,28 @@ MEDIUM_PRIORITY_WINDOWS = [
 ]
 
 # Telegram notification settings
-TELEGRAM_TOKEN = "7943333387:AAHg0p5-JaGsNEHQBLUPhSrp4ny-b49_2gc"
-TELEGRAM_CHAT_ID = "2008207882"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Database settings
+DB_DIR = os.getenv("DB_DIR", "data")
+DB_FILE = os.getenv("DB_FILE", "apartment_history.db")
+DATABASE_PATH = os.path.join(DB_DIR, DB_FILE)
+
+# Health check settings
+HEALTH_CHECK_ENABLED = os.getenv("HEALTH_CHECK_ENABLED", "false").lower() == "true"
+HEALTH_CHECK_PORT = int(os.getenv("HEALTH_CHECK_PORT", 8080))
 
 # Global variables for status tracking
 start_time = None
 last_check_time = None
 next_check_time = None
 last_command_update_id = 0  # Track the last processed command ID
+health_metrics = {}  # For storing health metrics
 
-# Create logs directory if it doesn't exist
+# Create necessary directories
 os.makedirs("logs", exist_ok=True)
+os.makedirs(DB_DIR, exist_ok=True)
 
 # Set up logging (console and file)
 logging.basicConfig(
@@ -57,7 +78,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(f"logs/apartment_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        logging.FileHandler(f"logs/watch_units_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     ]
 )
 logger = logging.getLogger(__name__)
@@ -73,7 +94,7 @@ USER_AGENTS = [
 
 def init_database():
     """Initialize SQLite database for tracking apartment availability history."""
-    conn = sqlite3.connect('apartment_history.db')
+    conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
     
     # Create availability history table
@@ -104,6 +125,18 @@ def init_database():
         num_checks INTEGER,
         num_availability_found INTEGER,
         errors INTEGER
+    )
+    ''')
+    
+    # Create health metrics table
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS health_metrics (
+        timestamp TEXT,
+        cpu_percent REAL,
+        memory_percent REAL,
+        uptime_seconds INTEGER,
+        checks_since_start INTEGER,
+        errors_since_start INTEGER
     )
     ''')
     
@@ -172,40 +205,108 @@ def update_stats(conn, found_availability=False, error=False):
     except Exception as e:
         logger.error(f"Error updating stats: {e}")
 
-def setup_driver():
-    """Lightweight browser setup for faster loading."""
+def log_health_metrics(conn):
+    """Log system health metrics to the database."""
+    if not conn:
+        return
+    
+    try:
+        c = conn.cursor()
+        timestamp = datetime.now().isoformat()
+        
+        # Get CPU and memory usage
+        cpu_percent = psutil.cpu_percent()
+        memory_percent = psutil.virtual_memory().percent
+        
+        # Calculate uptime
+        uptime_seconds = (datetime.now() - start_time).total_seconds()
+        
+        # Count checks and errors since start
+        c.execute("SELECT COUNT(*) FROM availability_history WHERE timestamp > ?", (start_time.isoformat(),))
+        checks_since_start = c.fetchone()[0]
+        
+        c.execute("SELECT SUM(errors) FROM stats WHERE date >= ?", (start_time.strftime('%Y-%m-%d'),))
+        errors_since_start = c.fetchone()[0] or 0
+        
+        # Update global health metrics
+        global health_metrics
+        health_metrics = {
+            "timestamp": timestamp,
+            "cpu_percent": cpu_percent,
+            "memory_percent": memory_percent,
+            "uptime_seconds": uptime_seconds,
+            "checks_since_start": checks_since_start,
+            "errors_since_start": errors_since_start
+        }
+        
+        # Insert into database
+        c.execute(
+            "INSERT INTO health_metrics VALUES (?, ?, ?, ?, ?, ?)",
+            (timestamp, cpu_percent, memory_percent, uptime_seconds, checks_since_start, errors_since_start)
+        )
+        
+        # Keep only the last 1000 records to prevent database bloat
+        c.execute("DELETE FROM health_metrics WHERE rowid NOT IN (SELECT rowid FROM health_metrics ORDER BY timestamp DESC LIMIT 1000)")
+        
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error logging health metrics: {e}")
+
+def setup_driver(headless=True):
+    """
+    Setup Selenium WebDriver with flexible configurations.
+    Works both locally and on servers.
+    """
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
+    
+    if headless:
+        chrome_options.add_argument("--headless")
+    
+    # Common options for better performance
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1366,768")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--no-sandbox")
     
-    # Disable images, CSS, and other resources to speed up loading
+    # Performance optimizations
     chrome_options.add_argument("--disable-images")
     chrome_options.add_argument("--disable-extensions")
     chrome_options.add_argument("--blink-settings=imagesEnabled=false")
     
-    # Only keep essential options, remove complex anti-detection
+    # Rotate user agent
     user_agent = random.choice(USER_AGENTS)
     chrome_options.add_argument(f"--user-agent={user_agent}")
     
+    # Get ChromeDriver path from environment (if set)
+    chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
+    
     try:
-        # Try to use webdriver manager to automatically download the driver
-        from webdriver_manager.chrome import ChromeDriverManager
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-    except Exception as e:
-        logger.warning(f"Failed to use webdriver_manager: {e}. Falling back to local chromedriver.")
-        # Fallback to local chromedriver
-        try:
-            driver = webdriver.Chrome(options=chrome_options)
-        except Exception as e:
-            logger.error(f"Error creating Chrome driver: {e}")
+        # Try different approaches to create the driver
+        if chromedriver_path and os.path.exists(chromedriver_path):
+            # Use specified chromedriver path
+            driver = webdriver.Chrome(service=Service(chromedriver_path), options=chrome_options)
+            logger.info(f"Using specified ChromeDriver at {chromedriver_path}")
+        else:
             try:
-                driver = webdriver.Chrome(service=Service("./chromedriver"), options=chrome_options)
+                # Try to use webdriver manager
+                from webdriver_manager.chrome import ChromeDriverManager
+                driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+                logger.info("Using ChromeDriver from webdriver_manager")
             except Exception as e:
-                logger.error(f"Final attempt to create driver failed: {e}")
-                raise
+                logger.warning(f"Failed to use webdriver_manager: {e}. Trying common paths.")
+                # Try common Linux paths
+                for path in ["/usr/bin/chromedriver", "/usr/local/bin/chromedriver"]:
+                    if os.path.exists(path):
+                        driver = webdriver.Chrome(service=Service(path), options=chrome_options)
+                        logger.info(f"Using ChromeDriver from {path}")
+                        break
+                else:
+                    # Fallback to local chromedriver
+                    driver = webdriver.Chrome(options=chrome_options)
+                    logger.info("Using default ChromeDriver")
+    except Exception as e:
+        logger.error(f"Error creating Chrome driver: {e}")
+        raise
     
     # Set page load timeout to prevent hanging
     driver.set_page_load_timeout(30)
@@ -436,6 +537,13 @@ def check_availability(driver, db_conn):
             args=(db_conn, bool(apartments_available), False)
         ).start()
         
+        # Log health metrics occasionally (20% of checks)
+        if random.random() < 0.2:
+            threading.Thread(
+                target=log_health_metrics,
+                args=(db_conn,)
+            ).start()
+        
         return apartments_available
         
     except TimeoutException:
@@ -453,6 +561,10 @@ def check_availability(driver, db_conn):
 
 def send_telegram_notification(message, db_conn=None):
     """Use a direct, simple HTTP request with minimal overhead."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram notifications disabled: missing token or chat ID")
+        return False
+        
     telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -490,12 +602,17 @@ def send_startup_notification(db_conn=None):
                       f"• /last - Show last check time\n" + \
                       f"• /status - Show full status\n" + \
                       f"• /stats - Show statistics\n" + \
-                      f"• /help - Show commands"
+                      f"• /help - Show commands\n\n" + \
+                      f"Health check enabled: {HEALTH_CHECK_ENABLED}\n" + \
+                      f"Health check port: {HEALTH_CHECK_PORT}"
     
     return send_telegram_notification(startup_message, db_conn)
 
 def process_telegram_commands(db_conn=None):
     """Process incoming Telegram commands with minimal overhead."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return  # Skip if Telegram is not configured
+        
     global last_command_update_id
     
     try:
@@ -585,7 +702,7 @@ def handle_last_command(chat_id, db_conn=None):
 
 def handle_status_command(chat_id, db_conn=None):
     """Handle the /status command: Show full status of the monitoring script."""
-    global last_check_time, start_time, next_check_time
+    global last_check_time, start_time, next_check_time, health_metrics
     
     uptime = datetime.now() - start_time
     days = uptime.days
@@ -614,6 +731,14 @@ def handle_status_command(chat_id, db_conn=None):
             seconds_until = time_until.total_seconds()
             message += f"• Next check: {next_check_time.strftime('%H:%M:%S')}\n"
             message += f"• Time until next: {int(seconds_until)} seconds\n"
+    
+    # Add system metrics if available
+    if health_metrics:
+        message += f"\n<b>System Health:</b>\n"
+        message += f"• CPU Usage: {health_metrics.get('cpu_percent', 'N/A')}%\n"
+        message += f"• Memory Usage: {health_metrics.get('memory_percent', 'N/A')}%\n"
+        message += f"• Checks since start: {health_metrics.get('checks_since_start', 'N/A')}\n"
+        message += f"• Errors since start: {health_metrics.get('errors_since_start', 'N/A')}\n"
     
     # Get current priority window
     now = datetime.now()
@@ -650,6 +775,13 @@ def handle_status_command(chat_id, db_conn=None):
         message += f"• Priority: ⚡ MEDIUM ({MEDIUM_PRIORITY_MIN}-{MEDIUM_PRIORITY_MAX}s)\n"
     else:
         message += f"• Priority: 🕙 NORMAL ({NORMAL_CHECK_INTERVAL_MIN}-{NORMAL_CHECK_INTERVAL_MAX}m)\n"
+    
+    # Add health check status
+    if HEALTH_CHECK_ENABLED:
+        message += f"\n<b>Health Check:</b>\n"
+        message += f"• Enabled: ✅\n"
+        message += f"• Port: {HEALTH_CHECK_PORT}\n"
+        message += f"• URL: http://localhost:{HEALTH_CHECK_PORT}/health"
     
     send_telegram_notification(message, db_conn)
 
@@ -689,6 +821,17 @@ def handle_stats_command(chat_id, db_conn=None):
             for apt_type, available in apartment_stats:
                 message += f"• {apt_type}: {available} times available\n"
         
+        # Get statistics for today
+        today = datetime.now().strftime('%Y-%m-%d')
+        c.execute("SELECT * FROM stats WHERE date = ?", (today,))
+        today_stats = c.fetchone()
+        
+        if today_stats:
+            message += f"\n<b>Today's Activity:</b>\n"
+            message += f"• Checks: {today_stats[1]}\n"
+            message += f"• Availabilities: {today_stats[2]}\n"
+            message += f"• Errors: {today_stats[3]}\n"
+        
         send_telegram_notification(message, db_conn)
     except Exception as e:
         logger.error(f"Error generating stats: {e}")
@@ -711,12 +854,33 @@ def handle_restart_command(chat_id, db_conn=None):
     message = f"⚠️ <b>Restart Request</b>\n\n"
     message += f"To restart manually:\n"
     message += f"1. Connect to server\n"
-    message += f"2. Stop current process\n"
-    message += f"3. Run 'python3 apartment_monitor.py'"
+    message += f"2. Stop current process: sudo supervisorctl stop ourcampus_monitor\n"
+    message += f"3. Start the process: sudo supervisorctl start ourcampus_monitor\n"
+    message += f"4. Check status: sudo supervisorctl status ourcampus_monitor"
     
     send_telegram_notification(message, db_conn)
 
-def main():
+def start_health_check_server():
+    """Start the health check server if enabled."""
+    if not HEALTH_CHECK_ENABLED:
+        logger.info("Health check server not enabled")
+        return
+    
+    # Dynamically import health_check.py only if needed
+    try:
+        import health_check
+        from multiprocessing import Process
+        
+        process = Process(target=health_check.run_server)
+        process.daemon = True  # This ensures the process will exit when the main process exits
+        process.start()
+        logger.info(f"Health check server started on port {HEALTH_CHECK_PORT}")
+    except ImportError:
+        logger.warning("Health check enabled but health_check.py not found")
+    except Exception as e:
+        logger.error(f"Failed to start health check server: {e}")
+
+def main(headless=True):
     """Main function to monitor apartment availability with improved speed."""
     global start_time, next_check_time
     
@@ -734,17 +898,24 @@ def main():
     # Send startup notification
     send_startup_notification(db_conn)
     
+    # Start health check server if enabled
+    start_health_check_server()
+    
     driver = None
     
     try:
-        driver = setup_driver()
+        driver = setup_driver(headless=headless)
         last_notified = set()  # Keep track of apartments we've already notified about
         command_check_time = 0  # Track when we last checked for commands
         browser_restart_counter = 0  # Counter for browser restarts
+        consecutive_errors = 0  # Track consecutive errors
         
         while True:
             try:
                 available_apartments = check_availability(driver, db_conn)
+                
+                # Reset error counter on successful check
+                consecutive_errors = 0
                 
                 if available_apartments:
                     current_available = set(available_apartments)
@@ -804,17 +975,28 @@ def main():
                     logger.info("Scheduled browser restart")
                     browser_restart_counter = 0
                     driver.quit()
-                    driver = setup_driver()
+                    driver = setup_driver(headless=headless)
                 
             except Exception as e:
                 logger.error(f"Error during check: {e}")
+                consecutive_errors += 1
+                
+                # If we have too many consecutive errors, send an alert
+                if consecutive_errors >= 5:
+                    error_message = f"⚠️ <b>Critical Error</b> ⚠️\n\n"
+                    error_message += f"Encountered {consecutive_errors} consecutive errors.\n"
+                    error_message += f"Last error: {str(e)}\n\n"
+                    error_message += f"Attempting to recover..."
+                    
+                    send_telegram_notification(error_message, db_conn)
+                    
                 time.sleep(30)  # Wait 30 seconds before trying again after an error
                 
                 # Restart the browser after errors
                 try:
                     if driver:
                         driver.quit()
-                    driver = setup_driver()
+                    driver = setup_driver(headless=headless)
                     browser_restart_counter = 0
                 except Exception as browser_error:
                     logger.error(f"Error restarting browser: {browser_error}")
@@ -830,5 +1012,10 @@ def main():
         logger.info("OurCampus monitor stopped")
 
 if __name__ == "__main__":
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='OurCampus Amsterdam Diemen apartment monitor')
+    parser.add_argument('--no-headless', action='store_true', help='Run Chrome in visible mode (not headless)')
+    args = parser.parse_args()
+    
     # Run the monitor
-    main()
+    main(headless=not args.no_headless)
