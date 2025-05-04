@@ -17,6 +17,13 @@ from selenium.common.exceptions import TimeoutException, WebDriverException, Sta
 import logging
 import threading
 from pathlib import Path
+import sys
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except AttributeError:
+    # Fallback for older Python versions
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer)
 
 # Try to import dotenv (but don't fail if it's not installed)
 try:
@@ -94,7 +101,7 @@ USER_AGENTS = [
 
 def init_database():
     """Initialize SQLite database for tracking apartment availability history."""
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     c = conn.cursor()
     
     # Create availability history table
