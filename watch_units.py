@@ -6,6 +6,9 @@ import os
 import sqlite3
 import psutil
 import argparse
+import webbrowser
+import subprocess
+import platform
 from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -18,6 +21,8 @@ import logging
 import threading
 from pathlib import Path
 import sys
+import io
+
 try:
     sys.stdout.reconfigure(encoding='utf-8')
 except AttributeError:
@@ -34,6 +39,10 @@ except ImportError:
 
 # Configuration
 URL = "https://book-ourcampus.securerc.co.uk/onlineleasing/ourcampus-amsterdam-diemen/floorplans.aspx"
+
+# SPEED MODE: Ultra-fast checking intervals
+SPEED_MODE_INTERVAL_MIN = 0.5  # 500ms minimum
+SPEED_MODE_INTERVAL_MAX = 1.5  # 1.5s maximum
 
 # Time window configurations with sensible defaults (can be overridden via .env)
 HIGH_PRIORITY_MIN = int(os.getenv("HIGH_PRIORITY_MIN", 20))  # seconds
@@ -55,6 +64,12 @@ MEDIUM_PRIORITY_WINDOWS = [
     {"day": 4, "start_hour": 13, "start_minute": 0, "end_hour": 19, "end_minute": 0},  # Friday 1pm-7pm
 ]
 
+# Apartment booking URLs for speed mode
+APARTMENT_URLS = {
+    "1 Person Apartment": "https://book-ourcampus.securerc.co.uk/onlineleasing/ourcampus-amsterdam-diemen/availableunits.aspx?myOlePropertyId=182358&MoveInDate=undefined&t=0.34374300842116357&floorPlans=1100004",
+    "2 Person Apartment": "https://book-ourcampus.securerc.co.uk/onlineleasing/ourcampus-amsterdam-diemen/availableunits.aspx?myOlePropertyId=182358&MoveInDate=undefined&t=0.34374300842116357&floorPlans=1100005"
+}
+
 # Telegram notification settings
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -74,18 +89,26 @@ last_check_time = None
 next_check_time = None
 last_command_update_id = 0  # Track the last processed command ID
 health_metrics = {}  # For storing health metrics
+speed_mode = False
+apartments_found_this_session = set()
 
 # Create necessary directories
 os.makedirs("logs", exist_ok=True)
 os.makedirs(DB_DIR, exist_ok=True)
 
-# Set up logging (console and file)
+# Configure console output for Windows
+if sys.platform.startswith('win'):
+    # Use UTF-8 for console output on Windows
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+# Set up logging (console and file) with Windows-compatible encoding
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(f"logs/watch_units_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        logging.FileHandler(f"logs/watch_units_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log", encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -260,10 +283,7 @@ def log_health_metrics(conn):
         logger.error(f"Error logging health metrics: {e}")
 
 def setup_driver(headless=True):
-    """
-    Setup Selenium WebDriver with flexible configurations.
-    Works both locally and on servers.
-    """
+    """Setup Selenium WebDriver with flexible configurations. Works both locally and on servers."""
     chrome_options = Options()
     
     if headless:
@@ -320,6 +340,152 @@ def setup_driver(headless=True):
     
     return driver
 
+def setup_speed_driver(headless=False):
+    """Setup ultra-fast Chrome driver optimized for speed."""
+    chrome_options = Options()
+    
+    if headless:
+        chrome_options.add_argument("--headless")
+    
+    # Speed optimizations (but keep JavaScript enabled!)
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-images")
+    # Don't disable JavaScript - we need it for the apartment tabs
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-plugins")
+    chrome_options.add_argument("--disable-web-security")
+    chrome_options.add_argument("--disable-features=VizDisplayCompositor")
+    chrome_options.add_argument("--disable-background-timer-throttling")
+    chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+    chrome_options.add_argument("--disable-renderer-backgrounding")
+    chrome_options.add_argument("--disable-background-networking")
+    chrome_options.add_argument("--aggressive-cache-discard")
+    chrome_options.add_argument("--disable-default-apps")
+    chrome_options.add_argument("--disable-sync")
+    
+    # Suppress GPU warnings
+    chrome_options.add_argument("--disable-logging")
+    chrome_options.add_argument("--log-level=3")
+    
+    # Minimal window size for speed
+    chrome_options.add_argument("--window-size=800,600")
+    
+    # Random user agent
+    user_agent = random.choice(USER_AGENTS)
+    chrome_options.add_argument(f"--user-agent={user_agent}")
+    
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        logger.info("Speed-optimized ChromeDriver created")
+    except Exception as e:
+        logger.error(f"Error creating Chrome driver: {e}")
+        raise
+    
+    # Ultra-short timeouts for speed
+    driver.set_page_load_timeout(15)  # Slightly longer to allow JS to load
+    driver.implicitly_wait(3)  # Slightly longer for element finding
+    
+    return driver
+
+def open_booking_page(apartment_type):
+    """Open the apartment booking page in a NEW BROWSER INSTANCE (very noticeable)."""
+    if apartment_type not in APARTMENT_URLS:
+        logger.error(f"Unknown apartment type: {apartment_type}")
+        return False
+    
+    url = APARTMENT_URLS[apartment_type]
+    
+    try:
+        # Method 1: Use subprocess to start completely new browser instance
+        system = platform.system().lower()
+        
+        if system == "windows":
+            # Windows: Start new Chrome instance
+            try:
+                subprocess.Popen([
+                    "start", 
+                    "chrome", 
+                    "--new-window",
+                    "--start-maximized",
+                    "--window-position=0,0",
+                    url
+                ], shell=True)
+                logger.info(f"SUCCESS: Opened NEW BROWSER INSTANCE for {apartment_type}")
+                return True
+            except Exception as e:
+                logger.warning(f"Chrome subprocess failed: {e}, trying alternative...")
+                
+                # Fallback: Try Edge
+                try:
+                    subprocess.Popen([
+                        "start", 
+                        "msedge", 
+                        "--new-window",
+                        "--start-maximized",
+                        url
+                    ], shell=True)
+                    logger.info(f"SUCCESS: Opened NEW EDGE INSTANCE for {apartment_type}")
+                    return True
+                except Exception as e2:
+                    logger.warning(f"Edge subprocess failed: {e2}, trying default browser...")
+        
+        elif system == "darwin":  # macOS
+            try:
+                subprocess.Popen([
+                    "open", 
+                    "-na", 
+                    "Google Chrome", 
+                    "--args", 
+                    "--new-window",
+                    "--start-maximized",
+                    url
+                ])
+                logger.info(f"SUCCESS: Opened NEW BROWSER INSTANCE for {apartment_type}")
+                return True
+            except Exception as e:
+                logger.warning(f"Chrome subprocess failed: {e}, trying Safari...")
+                try:
+                    subprocess.Popen(["open", "-a", "Safari", url])
+                    logger.info(f"SUCCESS: Opened NEW SAFARI INSTANCE for {apartment_type}")
+                    return True
+                except Exception as e2:
+                    logger.warning(f"Safari failed: {e2}, trying default browser...")
+        
+        else:  # Linux
+            try:
+                subprocess.Popen([
+                    "google-chrome", 
+                    "--new-window",
+                    "--start-maximized",
+                    url
+                ])
+                logger.info(f"SUCCESS: Opened NEW BROWSER INSTANCE for {apartment_type}")
+                return True
+            except Exception as e:
+                logger.warning(f"Chrome subprocess failed: {e}, trying Firefox...")
+                try:
+                    subprocess.Popen(["firefox", "--new-window", url])
+                    logger.info(f"SUCCESS: Opened NEW FIREFOX INSTANCE for {apartment_type}")
+                    return True
+                except Exception as e2:
+                    logger.warning(f"Firefox failed: {e2}, trying default browser...")
+        
+        # Final fallback: Use webbrowser module (opens new window when possible)
+        try:
+            # Register a new browser instance that opens new windows
+            webbrowser.open_new(url)  # open_new() opens new window instead of tab
+            logger.info(f"SUCCESS: Opened booking page (fallback method) for {apartment_type}")
+            return True
+        except Exception as e:
+            logger.error(f"All browser opening methods failed: {e}")
+            return False
+        
+    except Exception as e:
+        logger.error(f"Failed to open booking page: {e}")
+        return False
+
 def wait_for_element(driver, by, selector, timeout=15, poll_frequency=0.3):
     """Faster wait with lower timeout."""
     try:
@@ -365,10 +531,7 @@ def add_random_delay():
     time.sleep(base_delay)
 
 def get_check_interval():
-    """
-    Determine check interval based on current time.
-    Returns check interval in seconds with randomization.
-    """
+    """Determine check interval based on current time. Returns check interval in seconds with randomization."""
     now = datetime.now()
     current_day = now.weekday()  # 0=Monday, 1=Tuesday, ..., 6=Sunday
     current_hour = now.hour
@@ -384,7 +547,7 @@ def get_check_interval():
             
             # Randomize within high priority range
             interval = random.randint(HIGH_PRIORITY_MIN, HIGH_PRIORITY_MAX)
-            logger.info(f"🔥 HIGH PRIORITY TIME WINDOW - checking every {interval} seconds")
+            logger.info(f"HIGH PRIORITY TIME WINDOW - checking every {interval} seconds")
             return interval
     
     # Check if current time falls within any medium priority window
@@ -397,13 +560,17 @@ def get_check_interval():
             
             # Randomize within medium priority range
             interval = random.randint(MEDIUM_PRIORITY_MIN, MEDIUM_PRIORITY_MAX) 
-            logger.info(f"⚡ MEDIUM PRIORITY TIME WINDOW - checking every {interval} seconds")
+            logger.info(f"MEDIUM PRIORITY TIME WINDOW - checking every {interval} seconds")
             return interval
     
     # Otherwise use normal priority with randomized interval (in minutes, convert to seconds)
     interval = random.randint(NORMAL_CHECK_INTERVAL_MIN * 60, NORMAL_CHECK_INTERVAL_MAX * 60)
-    logger.info(f"🕙 NORMAL PRIORITY TIME - checking every {interval//60} minutes")
+    logger.info(f"NORMAL PRIORITY TIME - checking every {interval//60} minutes")
     return interval
+
+def get_speed_interval():
+    """Get check interval for speed mode."""
+    return random.uniform(SPEED_MODE_INTERVAL_MIN, SPEED_MODE_INTERVAL_MAX)
 
 def check_availability(driver, db_conn):
     """Check for apartment availability on the website with improved speed."""
@@ -566,6 +733,96 @@ def check_availability(driver, db_conn):
         threading.Thread(target=update_stats, args=(db_conn, False, True)).start()
         return []
 
+def check_availability_speed(driver):
+    """Ultra-fast availability check optimized for speed."""
+    global last_check_time
+    
+    logger.info("SPEED: Checking apartments...")
+    last_check_time = datetime.now()
+    
+    try:
+        # Load page with minimal timeout
+        driver.get(URL)
+        
+        # Wait for container with short timeout
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.ID, "floorPlanDataContainer"))
+            )
+        except TimeoutException:
+            logger.warning("Container not found quickly, continuing anyway...")
+        
+        apartments_available = []
+        
+        # Check 1 Person Apartment - try multiple approaches
+        try:
+            # Wait a bit for JavaScript to load the tabs
+            time.sleep(0.5)
+            
+            # Try multiple selectors for the first tab
+            tab1 = None
+            for selector in ["a[href='#FP_Detail_1100004']", "li.FPTabLi:first-child a", ".FPTabLi a"]:
+                try:
+                    tab1 = driver.find_element(By.CSS_SELECTOR, selector)
+                    break
+                except NoSuchElementException:
+                    continue
+            
+            if not tab1:
+                logger.warning("Could not find 1P apartment tab")
+            else:
+                # Click first tab
+                driver.execute_script("arguments[0].click();", tab1)
+                time.sleep(0.3)  # Wait for content to load
+                
+                # Get button text
+                button = driver.find_element(By.XPATH, "//div[@id='FP_Detail_1100004']//button[contains(@class, 'btn')]")
+                button_text = button.text.strip()
+                
+                logger.info(f"1P: '{button_text}'")
+                
+                if button_text and button_text not in ["CONTACT US", "Contact Us"]:
+                    apartments_available.append("1 Person Apartment")
+                    
+        except Exception as e:
+            logger.warning(f"Error checking 1P: {e}")
+        
+        # Check 2 Person Apartment
+        try:
+            # Try multiple selectors for the second tab
+            tab2 = None
+            for selector in ["a[href='#FP_Detail_1100005']", "li.FPTabLi:nth-child(2) a", ".FPTabLi:nth-child(2) a"]:
+                try:
+                    tab2 = driver.find_element(By.CSS_SELECTOR, selector)
+                    break
+                except NoSuchElementException:
+                    continue
+            
+            if not tab2:
+                logger.warning("Could not find 2P apartment tab")
+            else:
+                # Click second tab
+                driver.execute_script("arguments[0].click();", tab2)
+                time.sleep(0.3)  # Wait for content to load
+                
+                # Get button text
+                button = driver.find_element(By.XPATH, "//div[@id='FP_Detail_1100005']//button[contains(@class, 'btn')]")
+                button_text = button.text.strip()
+                
+                logger.info(f"2P: '{button_text}'")
+                
+                if button_text and button_text not in ["CONTACT US", "Contact Us"]:
+                    apartments_available.append("2 Person Apartment")
+                    
+        except Exception as e:
+            logger.warning(f"Error checking 2P: {e}")
+        
+        return apartments_available
+        
+    except Exception as e:
+        logger.error(f"Speed check error: {e}")
+        return []
+
 def send_telegram_notification(message, db_conn=None):
     """Use a direct, simple HTTP request with minimal overhead."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -597,9 +854,27 @@ def send_telegram_notification(message, db_conn=None):
                            args=(db_conn, message, False)).start()
         return False
 
+def send_speed_notification(message):
+    """Send notification only if Telegram is configured."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+        
+    try:
+        telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        response = requests.post(telegram_api_url, data=payload, timeout=3)
+        return response.status_code == 200
+    except:
+        return False
+
 def send_startup_notification(db_conn=None):
     """Send a startup notification to confirm Telegram is working."""
-    startup_message = f"🏠 <b>OurCampus Monitor Started</b> 🏠\n\n" + \
+    startup_message = f"OurCampus Monitor Started\n\n" + \
                       f"Monitoring started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n" + \
                       f"Priority-based checking:\n" + \
                       f"• High Priority: {HIGH_PRIORITY_MIN}-{HIGH_PRIORITY_MAX} seconds (Wednesdays 12:00-15:30)\n" + \
@@ -678,7 +953,7 @@ def handle_last_command(chat_id, db_conn=None):
         time_ago = datetime.now() - last_check_time
         minutes_ago = time_ago.total_seconds() // 60
         
-        message = f"✅ <b>Last Apartment Check</b>\n\n"
+        message = f"Last Apartment Check\n\n"
         message += f"Last checked: {last_check_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
         message += f"({int(minutes_ago)} minutes ago)"
         
@@ -695,15 +970,15 @@ def handle_last_command(chat_id, db_conn=None):
                 results = c.fetchall()
                 
                 if results:
-                    message += "\n\n<b>Latest apartment status:</b>\n"
+                    message += "\n\nLatest apartment status:\n"
                     for result in results:
                         apt_type, btn_text, is_available = result
-                        status = "✅ AVAILABLE" if is_available else "❌ Not available"
+                        status = "AVAILABLE" if is_available else "Not available"
                         message += f"• {apt_type}: {status}\n"
             except Exception as e:
                 logger.error(f"Error getting last availability from database: {e}")
     else:
-        message = "❓ No checks have been performed yet"
+        message = "No checks have been performed yet"
     
     send_telegram_notification(message, db_conn)
 
@@ -717,7 +992,7 @@ def handle_status_command(chat_id, db_conn=None):
     minutes, seconds = divmod(remainder, 60)
     uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
     
-    message = f"🏠 <b>OurCampus Monitor Status</b>\n\n"
+    message = f"OurCampus Monitor Status\n\n"
     message += f"• Script is running: ✅\n"
     message += f"• Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
     message += f"• Uptime: {uptime_str}\n"
@@ -741,51 +1016,15 @@ def handle_status_command(chat_id, db_conn=None):
     
     # Add system metrics if available
     if health_metrics:
-        message += f"\n<b>System Health:</b>\n"
+        message += f"\nSystem Health:\n"
         message += f"• CPU Usage: {health_metrics.get('cpu_percent', 'N/A')}%\n"
         message += f"• Memory Usage: {health_metrics.get('memory_percent', 'N/A')}%\n"
         message += f"• Checks since start: {health_metrics.get('checks_since_start', 'N/A')}\n"
         message += f"• Errors since start: {health_metrics.get('errors_since_start', 'N/A')}\n"
     
-    # Get current priority window
-    now = datetime.now()
-    current_day = now.weekday()
-    current_hour = now.hour
-    current_minute = now.minute
-    
-    # Check if current time falls within any high priority window
-    in_high_priority = False
-    for window in HIGH_PRIORITY_WINDOWS:
-        if (current_day == window["day"] and
-            (current_hour > window["start_hour"] or 
-             (current_hour == window["start_hour"] and current_minute >= window["start_minute"])) and
-            (current_hour < window["end_hour"] or
-             (current_hour == window["end_hour"] and current_minute <= window["end_minute"]))):
-            in_high_priority = True
-            break
-    
-    # Check if current time falls within any medium priority window
-    in_medium_priority = False
-    if not in_high_priority:
-        for window in MEDIUM_PRIORITY_WINDOWS:
-            if (current_day == window["day"] and
-                (current_hour > window["start_hour"] or 
-                 (current_hour == window["start_hour"] and current_minute >= window["start_minute"])) and
-                (current_hour < window["end_hour"] or
-                 (current_hour == window["end_hour"] and current_minute <= window["end_minute"]))):
-                in_medium_priority = True
-                break
-    
-    if in_high_priority:
-        message += f"• Priority: 🔥 HIGH ({HIGH_PRIORITY_MIN}-{HIGH_PRIORITY_MAX}s)\n"
-    elif in_medium_priority:
-        message += f"• Priority: ⚡ MEDIUM ({MEDIUM_PRIORITY_MIN}-{MEDIUM_PRIORITY_MAX}s)\n"
-    else:
-        message += f"• Priority: 🕙 NORMAL ({NORMAL_CHECK_INTERVAL_MIN}-{NORMAL_CHECK_INTERVAL_MAX}m)\n"
-    
     # Add health check status
     if HEALTH_CHECK_ENABLED:
-        message += f"\n<b>Health Check:</b>\n"
+        message += f"\nHealth Check:\n"
         message += f"• Enabled: ✅\n"
         message += f"• Port: {HEALTH_CHECK_PORT}\n"
         message += f"• URL: http://localhost:{HEALTH_CHECK_PORT}/health"
@@ -795,7 +1034,7 @@ def handle_status_command(chat_id, db_conn=None):
 def handle_stats_command(chat_id, db_conn=None):
     """Handle the /stats command: Show simplified statistics."""
     if not db_conn:
-        message = "⚠️ Database not available for statistics."
+        message = "Database not available for statistics."
         send_telegram_notification(message)
         return
     
@@ -811,7 +1050,7 @@ def handle_stats_command(chat_id, db_conn=None):
         total_availabilities = c.fetchone()[0]
         
         # Create the message
-        message = f"📊 <b>Statistics</b>\n\n"
+        message = f"Statistics\n\n"
         message += f"• Total checks: {total_checks}\n"
         message += f"• Total availabilities: {total_availabilities}\n"
         
@@ -824,7 +1063,7 @@ def handle_stats_command(chat_id, db_conn=None):
         apartment_stats = c.fetchall()
         
         if apartment_stats:
-            message += f"\n<b>By Apartment Type:</b>\n"
+            message += f"\nBy Apartment Type:\n"
             for apt_type, available in apartment_stats:
                 message += f"• {apt_type}: {available} times available\n"
         
@@ -834,7 +1073,7 @@ def handle_stats_command(chat_id, db_conn=None):
         today_stats = c.fetchone()
         
         if today_stats:
-            message += f"\n<b>Today's Activity:</b>\n"
+            message += f"\nToday's Activity:\n"
             message += f"• Checks: {today_stats[1]}\n"
             message += f"• Availabilities: {today_stats[2]}\n"
             message += f"• Errors: {today_stats[3]}\n"
@@ -842,12 +1081,12 @@ def handle_stats_command(chat_id, db_conn=None):
         send_telegram_notification(message, db_conn)
     except Exception as e:
         logger.error(f"Error generating stats: {e}")
-        message = f"⚠️ Error generating statistics: {e}"
+        message = f"Error generating statistics: {e}"
         send_telegram_notification(message, db_conn)
 
 def handle_help_command(chat_id, db_conn=None):
     """Handle the /help command: Show available commands."""
-    message = f"🏠 <b>Available Commands</b>\n\n"
+    message = f"Available Commands\n\n"
     message += f"• /last - Last check time\n"
     message += f"• /status - Monitor status\n"
     message += f"• /stats - Show statistics\n"
@@ -858,7 +1097,7 @@ def handle_help_command(chat_id, db_conn=None):
 
 def handle_restart_command(chat_id, db_conn=None):
     """Handle the /restart command: Suggest manual restart procedures."""
-    message = f"⚠️ <b>Restart Request</b>\n\n"
+    message = f"Restart Request\n\n"
     message += f"To restart manually:\n"
     message += f"1. Connect to server\n"
     message += f"2. Stop current process: sudo supervisorctl stop ourcampus_monitor\n"
@@ -886,6 +1125,254 @@ def start_health_check_server():
         logger.warning("Health check enabled but health_check.py not found")
     except Exception as e:
         logger.error(f"Failed to start health check server: {e}")
+
+def debug_page_structure(driver):
+    """Debug function to see what's actually on the page."""
+    try:
+        logger.info("DEBUGGING: Loading page...")
+        driver.get(URL)
+        
+        # Wait a bit for page to load
+        time.sleep(3)
+        
+        # Get page title
+        logger.info(f"DEBUGGING: Page title: {driver.title}")
+        
+        # Get page source length
+        logger.info(f"DEBUGGING: Page source length: {len(driver.page_source)} characters")
+        
+        # Look for the main container
+        try:
+            container = driver.find_element(By.ID, "floorPlanDataContainer")
+            logger.info("DEBUGGING: Found floorPlanDataContainer!")
+            logger.info(f"DEBUGGING: Container text (first 200 chars): {container.text[:200]}")
+        except:
+            logger.info("DEBUGGING: floorPlanDataContainer NOT FOUND")
+            
+            # Try to find any container
+            containers = driver.find_elements(By.TAG_NAME, "div")
+            logger.info(f"DEBUGGING: Found {len(containers)} div elements")
+            
+            # Look for any element with "floor" or "plan" in the ID
+            elements_with_floor = driver.find_elements(By.XPATH, "//*[contains(@id,'floor') or contains(@id,'plan') or contains(@id,'Floor') or contains(@id,'Plan')]")
+            logger.info(f"DEBUGGING: Found {len(elements_with_floor)} elements with 'floor' or 'plan' in ID")
+            for elem in elements_with_floor[:3]:  # Show first 3
+                logger.info(f"DEBUGGING: Element ID: {elem.get_attribute('id')}, Tag: {elem.tag_name}")
+        
+        # Look for any tabs or links
+        all_links = driver.find_elements(By.TAG_NAME, "a")
+        logger.info(f"DEBUGGING: Found {len(all_links)} link elements")
+        
+        # Look for links that might be apartment tabs
+        apartment_links = []
+        for link in all_links:
+            href = link.get_attribute("href") or ""
+            text = link.text.strip()
+            if "1100004" in href or "1100005" in href or "person" in text.lower() or "apartment" in text.lower():
+                apartment_links.append(f"Link: '{text}' -> {href}")
+        
+        if apartment_links:
+            logger.info("DEBUGGING: Found potential apartment links:")
+            for link in apartment_links[:5]:  # Show first 5
+                logger.info(f"DEBUGGING: {link}")
+        else:
+            logger.info("DEBUGGING: No apartment-related links found")
+        
+        # Look for any buttons
+        buttons = driver.find_elements(By.TAG_NAME, "button")
+        logger.info(f"DEBUGGING: Found {len(buttons)} button elements")
+        for button in buttons[:3]:  # Show first 3 buttons
+            logger.info(f"DEBUGGING: Button text: '{button.text.strip()}' Class: {button.get_attribute('class')}")
+        
+        # Look for elements with specific classes
+        fp_elements = driver.find_elements(By.XPATH, "//*[contains(@class,'FP') or contains(@class,'fp')]")
+        logger.info(f"DEBUGGING: Found {len(fp_elements)} elements with 'FP' or 'fp' in class")
+        
+        # Save page source to file for inspection
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        with open(f"logs/debug_page_source_{timestamp}.html", "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        logger.info(f"DEBUGGING: Page source saved to logs/debug_page_source_{timestamp}.html")
+        
+    except Exception as e:
+        logger.error(f"DEBUGGING: Error during page debug: {e}")
+
+def simple_test_browser_opening():
+    """Simple test to just open browser tabs without checking website."""
+    logger.info("SIMPLE TEST: Testing NEW BROWSER INSTANCE opening...")
+    logger.info("SIMPLE TEST: You should see completely new browser windows open (not just tabs)!")
+    
+    logger.info("SIMPLE TEST: Opening 1 Person Apartment booking page in NEW BROWSER INSTANCE...")
+    success1 = open_booking_page("1 Person Apartment")
+    
+    time.sleep(2)  # Brief delay between opens so you can see them separately
+    
+    logger.info("SIMPLE TEST: Opening 2 Person Apartment booking page in NEW BROWSER INSTANCE...")
+    success2 = open_booking_page("2 Person Apartment")
+    
+    if success1 and success2:
+        logger.info("SIMPLE TEST: SUCCESS! Two NEW BROWSER INSTANCES should have opened (not tabs)!")
+        logger.info("SIMPLE TEST: These should be maximized and very noticeable!")
+    else:
+        logger.error("SIMPLE TEST: Some browser instances failed to open.")
+    
+    return success1 and success2
+
+def speed_mode_main(test_mode=False):
+    """Main function optimized for maximum speed."""
+    global start_time, next_check_time, apartments_found_this_session
+    
+    start_time = datetime.now()
+    
+    if test_mode:
+        logger.info("TEST MODE: Starting speed mode for testing!")
+        logger.info("TEST: Will simulate apartment availability in 15 seconds to test browser opening")
+    else:
+        logger.info("SPEED MODE: Starting maximum performance monitoring!")
+        
+    logger.info(f"Check interval: {SPEED_MODE_INTERVAL_MIN}-{SPEED_MODE_INTERVAL_MAX} seconds")
+    
+    # Send startup notification if Telegram is configured
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        if test_mode:
+            startup_msg = f"TEST MODE ACTIVATED\n\n"
+            startup_msg += f"Testing browser tab opening in 15 seconds!\n"
+        else:
+            startup_msg = f"SPEED MODE ACTIVATED\n\n"
+            startup_msg += f"Ultra-fast monitoring started!\n"
+        startup_msg += f"Check interval: {SPEED_MODE_INTERVAL_MIN}-{SPEED_MODE_INTERVAL_MAX}s\n"
+        startup_msg += f"Browser instances will open automatically when apartments are found!"
+        send_speed_notification(startup_msg)
+    
+    driver = None
+    test_triggered = False
+    
+    try:
+        if not test_mode:
+            driver = setup_speed_driver(headless=True)  # Headless for speed
+        check_count = 0
+        
+        while True:
+            try:
+                # TEST MODE: Simulate apartment availability after 15 seconds
+                if test_mode and not test_triggered:
+                    uptime = (datetime.now() - start_time).total_seconds()
+                    if uptime >= 15:
+                        logger.info("TEST: Simulating apartment availability!")
+                        available_apartments = ["1 Person Apartment", "2 Person Apartment"]  # Simulate both apartments available
+                        test_triggered = True
+                    else:
+                        available_apartments = []
+                        logger.info(f"TEST: Waiting for 15 seconds... ({int(15-uptime)} seconds remaining)")
+                else:
+                    # Normal mode: Actually check the website
+                    available_apartments = check_availability_speed(driver) if not test_mode else []
+                
+                check_count += 1
+                
+                if available_apartments:
+                    new_apartments = set(available_apartments) - apartments_found_this_session
+                    
+                    if new_apartments:
+                        logger.info(f"SUCCESS: New apartments found: {new_apartments}")
+                        
+                        # MAXIMUM ATTENTION: Open booking pages in NEW BROWSER INSTANCES
+                        for apt_type in new_apartments:
+                            logger.info(f"APARTMENT ALERT: Opening {apt_type} booking page!")
+                            success = open_booking_page(apt_type)
+                            if success:
+                                logger.info(f"SUCCESS: NEW BROWSER INSTANCE opened for {apt_type}")
+                                
+                                # Additional attention-getting measures
+                                try:
+                                    # Try to make a system beep sound (Windows)
+                                    if platform.system().lower() == "windows":
+                                        import winsound
+                                        winsound.Beep(1000, 500)  # 1000Hz for 500ms
+                                except:
+                                    pass
+                                    
+                            else:
+                                logger.error(f"ERROR: Failed to open browser instance for {apt_type}")
+                        
+                        # Send notification as backup
+                        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                            msg = f"APARTMENTS AVAILABLE!\n\n"
+                            for apt in new_apartments:
+                                msg += f"• {apt}\n"
+                            msg += f"\nNew browser instances should have opened automatically!"
+                            send_speed_notification(msg)
+                        
+                        # Update found apartments
+                        apartments_found_this_session.update(new_apartments)
+                    else:
+                        logger.info(f"Same apartments still available: {available_apartments}")
+                else:
+                    # Reset if no apartments found
+                    if apartments_found_this_session:
+                        logger.info("No apartments available now - resetting tracker")
+                        apartments_found_this_session = set()
+                
+                # Calculate next check time
+                if test_mode:
+                    interval = 2.0  # Faster checking in test mode
+                else:
+                    interval = get_speed_interval()
+                next_check_time = datetime.now() + timedelta(seconds=interval)
+                
+                # Status update every 50 checks (or every 5 in test mode)
+                status_interval = 5 if test_mode else 50
+                if check_count % status_interval == 0:
+                    uptime = datetime.now() - start_time
+                    if test_mode:
+                        logger.info(f"TEST Check #{check_count} | Uptime: {uptime} | Next: {interval:.1f}s")
+                    else:
+                        logger.info(f"STATUS Check #{check_count} | Uptime: {uptime} | Next: {interval:.1f}s")
+                
+                time.sleep(interval)
+                
+                # In test mode, exit after successful test
+                if test_mode and test_triggered and available_apartments:
+                    logger.info("TEST COMPLETED! Browser instances should have opened.")
+                    logger.info("TEST: Test mode finished. Press Ctrl+C to exit or wait for auto-exit...")
+                    time.sleep(5)  # Give user time to see the opened tabs
+                    break
+                
+                # Restart browser every 100 checks to prevent issues (skip in test mode)
+                if not test_mode and check_count % 100 == 0:
+                    logger.info("MAINTENANCE: Restarting browser for performance...")
+                    driver.quit()
+                    driver = setup_speed_driver(headless=True)
+                
+            except Exception as e:
+                logger.error(f"Error during speed check: {e}")
+                if not test_mode:
+                    time.sleep(2)  # Brief pause before retry
+                    
+                    # Try to restart browser on error
+                    try:
+                        if driver:
+                            driver.quit()
+                        driver = setup_speed_driver(headless=True)
+                    except Exception as browser_error:
+                        logger.error(f"Browser restart failed: {browser_error}")
+                        time.sleep(5)
+                else:
+                    # In test mode, just continue
+                    time.sleep(1)
+                
+    except KeyboardInterrupt:
+        if test_mode:
+            logger.info("Test mode stopped by user")
+        else:
+            logger.info("Speed mode stopped by user")
+    finally:
+        if driver:
+            driver.quit()
+        if test_mode:
+            logger.info("TEST MODE: Test mode ended")
+        else:
+            logger.info("SPEED MODE: Speed mode ended")
 
 def main(headless=True):
     """Main function to monitor apartment availability with improved speed."""
@@ -931,11 +1418,11 @@ def main(headless=True):
                     if new_available:
                         logger.info(f"New apartments available! {new_available}")
                         
-                        message = "🎉 <b>OurCampus Apartments Available!</b> 🎉\n\n"
+                        message = "OurCampus Apartments Available!\n\n"
                         message += "The following apartments are now available:\n\n"
                         for apt in new_available:
                             message += f"• {apt}\n"
-                        message += f"\n🔗 <a href='{URL}'>Click here to apply now!</a>"
+                        message += f"\nClick here to apply now: {URL}"
                         
                         send_telegram_notification(message, db_conn)
                         last_notified = current_available
@@ -946,7 +1433,7 @@ def main(headless=True):
                     # Only reset notification tracking if we've previously found something
                     if last_notified:
                         # Notify about apartments no longer available
-                        message = "ℹ️ <b>OurCampus Update</b> ℹ️\n\n"
+                        message = "OurCampus Update\n\n"
                         message += "Previously available apartments are no longer listed."
                         send_telegram_notification(message, db_conn)
                         last_notified = set()
@@ -990,7 +1477,7 @@ def main(headless=True):
                 
                 # If we have too many consecutive errors, send an alert
                 if consecutive_errors >= 5:
-                    error_message = f"⚠️ <b>Critical Error</b> ⚠️\n\n"
+                    error_message = f"Critical Error\n\n"
                     error_message += f"Encountered {consecutive_errors} consecutive errors.\n"
                     error_message += f"Last error: {str(e)}\n\n"
                     error_message += f"Attempting to recover..."
@@ -1021,8 +1508,101 @@ def main(headless=True):
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='OurCampus Amsterdam Diemen apartment monitor')
+    parser.add_argument('--speed-mode', action='store_true', 
+                       help='Run in ultra-fast speed mode (for local use during apartment releases)')
+    parser.add_argument('--test-mode', action='store_true',
+                       help='Test mode: Simulate apartment availability after 15 seconds to test browser opening')
+    parser.add_argument('--debug-page', action='store_true',
+                       help='Debug mode: Show what elements are actually on the page')
+    parser.add_argument('--test-browser', action='store_true',
+                       help='Simple test: Just test opening browser tabs without checking website')
+    parser.add_argument('--test-full', action='store_true',
+                       help='Full test: Simulate finding apartments and test complete workflow')
     parser.add_argument('--no-headless', action='store_true', help='Run Chrome in visible mode (not headless)')
     args = parser.parse_args()
     
     # Run the monitor
-    main(headless=not args.no_headless)
+    if args.debug_page:
+        print("DEBUG MODE ACTIVATED!")
+        print("Will analyze the website structure and save details to logs/")
+        print("This will help identify why apartment tabs aren't being found")
+        print("-" * 60)
+        
+        # Run debug mode
+        driver = None
+        try:
+            driver = setup_speed_driver(headless=False)  # Visible mode for debugging
+            debug_page_structure(driver)
+            logger.info("DEBUG: Analysis complete! Check the logs for details.")
+        finally:
+            if driver:
+                driver.quit()
+                
+    elif args.test_browser:
+        print("BROWSER TEST MODE ACTIVATED!")
+        print("Will test opening NEW BROWSER INSTANCES (not tabs) in 3 seconds...")
+        print("You should see maximized browser windows open!")
+        print("-" * 60)
+        
+        time.sleep(3)  # Give user time to see message
+        simple_test_browser_opening()
+        
+    elif args.test_full:
+        print("FULL TEST MODE ACTIVATED!")
+        print("Will simulate finding apartments and test complete workflow in 5 seconds...")
+        print("This tests: Website checking + Browser opening + Notifications")
+        print("-" * 60)
+        
+        # Simulate the complete apartment finding workflow
+        time.sleep(5)
+        logger.info("FULL TEST: Simulating apartment discovery...")
+        
+        # Simulate finding both apartments
+        new_apartments = {"1 Person Apartment", "2 Person Apartment"}
+        logger.info(f"SUCCESS: New apartments found: {new_apartments}")
+        
+        # Open booking pages with all the bells and whistles
+        for apt_type in new_apartments:
+            logger.info(f"APARTMENT ALERT: Opening {apt_type} booking page!")
+            success = open_booking_page(apt_type)
+            if success:
+                logger.info(f"SUCCESS: NEW BROWSER INSTANCE opened for {apt_type}")
+                
+                # Audio alert
+                try:
+                    if platform.system().lower() == "windows":
+                        import winsound
+                        winsound.Beep(1000, 500)  # 1000Hz for 500ms
+                except:
+                    pass
+            else:
+                logger.error(f"ERROR: Failed to open browser instance for {apt_type}")
+            
+            time.sleep(1)  # Brief delay between openings
+        
+        # Send Telegram notification if configured
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            msg = f"APARTMENTS AVAILABLE!\n\n"
+            for apt in new_apartments:
+                msg += f"• {apt}\n"
+            msg += f"\nNew browser instances should have opened automatically!"
+            send_speed_notification(msg)
+            logger.info("FULL TEST: Telegram notification sent!")
+        
+        logger.info("FULL TEST: Complete workflow test finished!")
+        
+    elif args.speed_mode or args.test_mode:
+        if args.test_mode:
+            print("TEST MODE ACTIVATED!")
+            print("Will simulate apartment availability in 15 seconds")
+            print("Browser tabs should open automatically when apartments are 'found'")
+            print("Press Ctrl+C to stop")
+        else:
+            print("SPEED MODE ACTIVATED!")
+            print("Ultra-fast checking enabled")
+            print("Browser instances will open automatically when apartments are found")
+            print("Press Ctrl+C to stop")
+        print("-" * 60)
+        speed_mode_main(test_mode=args.test_mode)
+    else:
+        main(headless=not args.no_headless)
